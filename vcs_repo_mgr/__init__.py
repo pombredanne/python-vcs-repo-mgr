@@ -1,7 +1,7 @@
 # Version control system repository manager.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: June 25, 2014
+# Last Change: November 2, 2014
 # URL: https://github.com/xolox/python-vcs-repo-mgr
 
 """
@@ -34,7 +34,7 @@ From github.com:xolox/python-verboselogs
 """
 
 # Semi-standard module versioning.
-__version__ = '0.4'
+__version__ = '0.7'
 
 # Standard library modules.
 import functools
@@ -42,18 +42,15 @@ import logging
 import os
 import pipes
 import re
+import tempfile
 import time
-
-try:
-    # Python 2.x.
-    import ConfigParser as configparser
-except ImportError:
-    # Python 3.x.
-    import configparser
 
 # External dependencies.
 from executor import execute
 from humanfriendly import concatenate, format_path
+from six import string_types
+from six.moves import configparser
+from six.moves import urllib_parse as urlparse
 
 # Known configuration file locations.
 USER_CONFIG_FILE = os.path.expanduser('~/.vcs-repo-mgr.ini')
@@ -67,6 +64,49 @@ logger = logging.getLogger(__name__)
 
 # Inject our logger into all execute() calls.
 execute = functools.partial(execute, logger=logger)
+
+def coerce_repository(value):
+    """
+    Convert a string (taken to be a repository name or URL) to a
+    :py:class:`Repository` object.
+
+    :param value: The name or URL of a repository (a string or a
+                  :py:class:`Repository` object).
+    :returns: A :py:class:`Repository` object.
+    :raises: :py:exc:`exceptions.ValueError` when the given ``value`` is not a
+             string or a :py:class:`Repository` object or if the value is a string but
+             doesn't match the name of any configured repository and also can't
+             be parsed as the location of a remote repository.
+    """
+    # Repository objects pass through untouched.
+    if isinstance(value, Repository):
+        return value
+    # We expect a string with a name or URL.
+    if not isinstance(value, string_types):
+        msg = "Expected string or Repository object as argument, got %s instead!"
+        raise ValueError(msg % type(value))
+    # If the string matches the name of a configured repository we'll return that.
+    try:
+        return find_configured_repository(value)
+    except NoSuchRepositoryError:
+        pass
+    # At this point we'll assume the string is the location of a remote
+    # repository. First lets see if the repository type is prefixed to the
+    # remote location with a `+' in between (pragmatic but ugly :-).
+    vcs_type, _, remote = value.partition('+')
+    if vcs_type and remote:
+        try:
+            return repository_factory(vcs_type, local=find_cache_directory(remote), remote=remote)
+        except UnknownRepositoryTypeError:
+            pass
+    # Check for remote locations that end with the suffix `.git' (fairly common).
+    if value.endswith('.git'):
+        return GitRepo(local=find_cache_directory(value), remote=value)
+    # If all else fails, at least give a clear explanation of the problem.
+    msg = ("The string %r doesn't match the name of any configured repository"
+           " and it also can't be parsed as the location of a remote"
+           " repository! (maybe you forgot to prefix the type?)")
+    raise ValueError(msg % value)
 
 def find_configured_repository(name):
     """
@@ -86,13 +126,19 @@ def find_configured_repository(name):
        local = /home/peter/projects/vcs-repo-mgr
        remote = git@github.com:xolox/python-vcs-repo-mgr.git
 
-    Two VCS types are currently supported: ``hg`` (``mercurial`` is also
-    accepted) and ``git``. If an unsupported VCS type is used or no repository
-    can be found matching the given name :py:exc:`exceptions.ValueError` is
-    raised.
+    Three VCS types are currently supported: ``hg`` (``mercurial`` is also
+    accepted), ``git`` and ``bzr`` (``bazaar`` is also accepted). If an
+    unsupported VCS type is used or no repository can be found matching the
+    given name :py:exc:`exceptions.ValueError` is raised.
 
     :param name: The name of the repository (a string).
     :returns: A :py:class:`Repository` object.
+    :raises: :py:exc:`NoSuchRepositoryError` when the given repository name
+             doesn't match any of the configured repositories.
+    :raises: :py:exc:`AmbiguousRepositoryNameError` when the given repository
+             name is ambiguous (i.e. it matches multiple repository names).
+    :raises: :py:exp:`UnknownRepositoryTypeError` when a repository definition
+             with an unknown type is encountered.
     """
     parser = configparser.RawConfigParser()
     for config_file in [SYSTEM_CONFIG_FILE, USER_CONFIG_FILE]:
@@ -102,19 +148,43 @@ def find_configured_repository(name):
     matching_repos = [r for r in parser.sections() if normalize_name(name) == normalize_name(r)]
     if not matching_repos:
         msg = "No repositories found matching the name %r!"
-        raise ValueError(msg % name)
+        raise NoSuchRepositoryError(msg % name)
     elif len(matching_repos) != 1:
         msg = "Multiple repositories found matching the name %r! (%s)"
-        raise ValueError(msg % (name, concatenate(map(repr, matching_repos))))
+        raise AmbiguousRepositoryNameError(msg % (name, concatenate(map(repr, matching_repos))))
     else:
         options = dict(parser.items(matching_repos[0]))
         vcs_type = options.get('type', '').lower()
-        if vcs_type in ('hg', 'mercurial'):
-            return HgRepo(local=options.get('local'), remote=options.get('remote'))
-        elif vcs_type == 'git':
-            return GitRepo(local=options.get('local'), remote=options.get('remote'))
-        else:
-            raise ValueError("VCS type not supported! (%s)" % vcs_type)
+        return repository_factory(vcs_type,
+                                  local=options.get('local'),
+                                  remote=options.get('remote'))
+
+def repository_factory(vcs_type, **kw):
+    """
+    Instantiate a :py:class:`Repository` object based on the given type and arguments.
+
+    :param vcs_type: One of the strings 'bazaar', 'bzr', 'git', 'hg' or 'mercurial'.
+    :param kw: The keyword arguments to :py:func:`Repository.__init__()`.
+    :returns: A :py:class:`Repository` object.
+    :raises: :py:exc:`UnknownRepositoryTypeError` when the given type is unknown.
+    """
+    if vcs_type in ('bzr', 'bazaar'):
+        return BzrRepo(**kw)
+    elif vcs_type == 'git':
+        return GitRepo(**kw)
+    elif vcs_type in ('hg', 'mercurial'):
+        return HgRepo(**kw)
+    else:
+        raise UnknownRepositoryTypeError("Unknown VCS repository type! (%r)" % vcs_type)
+
+def find_cache_directory(remote):
+    """
+    Find the directory where temporary local checkouts are to be stored.
+
+    :returns: The absolute pathname of a directory (a string).
+    """
+    return os.path.join('/var/cache/vcs-repo-mgr' if os.access('/var/cache', os.W_OK) else tempfile.gettempdir(),
+                        urlparse.quote(remote, safe=''))
 
 def normalize_name(name):
     """
@@ -126,6 +196,26 @@ def normalize_name(name):
     :returns: The normalized repository name (a string).
     """
     return re.sub('[^a-z0-9]', '', name.lower())
+
+def sum_revision_numbers(arguments):
+    """
+    Sum revision numbers of multiple repository/revision pairs. This is useful
+    when you're building a package based on revisions from multiple VCS
+    repositories. By taking changes in all repositories into account when
+    generating version numbers you can make sure that your version number is
+    bumped with every single change.
+
+    :param arguments: A list of strings with repository names and revision
+                      strings.
+    :returns: A single integer containing the summed revision numbers.
+    """
+    if len(arguments) % 2 != 0:
+        raise ValueError("Please provide an even number of arguments! (one or more repository/revision pairs)")
+    summed_revision_number = 0
+    while arguments:
+        repository = coerce_repository(arguments.pop(0))
+        summed_revision_number += repository.find_revision_number(arguments.pop(0))
+    return summed_revision_number
 
 class limit_vcs_updates(object):
 
@@ -156,9 +246,7 @@ class Repository(object):
 
     def __init__(self, local=None, remote=None):
         """
-        Initialize a version control repository interface. Raises
-        :py:exc:`exceptions.ValueError` if the local repository doesn't exist
-        and no remote repository is specified.
+        Initialize a version control repository interface.
 
         :param local: The pathname of the directory where the local clone of
                       the repository is stored (a string). This directory
@@ -167,6 +255,8 @@ class Repository(object):
         :param remote: The URL of the remote repository (a string). If this is
                        not given then the local directory must already exist
                        and contain a supported repository.
+        :raises: :py:exc:`exceptions.ValueError` if the local repository
+                 doesn't exist and no remote repository is specified.
         """
         self.local = local
         self.remote = remote
@@ -181,7 +271,7 @@ class Repository(object):
 
         :returns: The pathname of a directory (a string).
         """
-        raise NotImplemented()
+        raise NotImplementedError()
 
     @property
     def exists(self):
@@ -190,7 +280,7 @@ class Repository(object):
 
         :returns: ``True`` if the local directory contains a repository, ``False`` otherwise.
         """
-        raise NotImplemented()
+        raise NotImplementedError()
 
     @property
     def last_updated_file(self):
@@ -293,9 +383,9 @@ class Repository(object):
 
         .. note:: Automatically creates the local repository on the first run.
         """
-        raise NotImplemented()
+        raise NotImplementedError()
 
-    def find_revision_id(self, revision):
+    def find_revision_id(self, revision=None):
         """
         Find the global revision id of the given revision.
 
@@ -306,7 +396,22 @@ class Repository(object):
 
         .. note:: Automatically creates the local repository on the first run.
         """
-        raise NotImplemented()
+        raise NotImplementedError()
+
+    def generate_control_field(self, revision=None):
+        """
+        Generate a Debian control file name/value pair for the given repository
+        and revision. This generates a ``Vcs-Bzr`` field for Bazaar_
+        repositories, a ``Vcs-Hg`` field for Mercurial_ repositories and a
+        ``Vcs-Git`` field for Git_ repositories.
+
+        :param revision: A reference to a revision, most likely the name of a
+                         branch (a string). Defaults to the latest revision in
+                         the default branch.
+        :returns: A tuple with two strings: The name of the field and the value.
+        """
+        value = "%s#%s" % (self.remote or self.local, self.find_revision_id(revision))
+        return self.control_field, value
 
     @property
     def branches(self):
@@ -319,10 +424,36 @@ class Repository(object):
         .. note:: Automatically creates the local repository on the first run.
         """
         self.create()
-        mapping = {}
-        for revision in self.find_branches():
-            mapping[revision.branch] = revision
-        return mapping
+        return dict((r.branch, r) for r in self.find_branches())
+
+    @property
+    def tags(self):
+        """
+        Find information about the tags in the version control repository.
+
+        :returns: A :py:class:`dict` with tag names (strings) as keys and
+                  :py:class:`Revision` objects as values.
+
+        .. note:: Automatically creates the local repository on the first run.
+        """
+        self.create()
+        return dict((r.tag, r) for r in self.find_tags())
+
+    def find_branches(self):
+        """
+        Find information about the branches in the version control repository.
+
+        :returns: A generator of :py:class:`Revision` objects.
+        """
+        raise NotImplementedError()
+
+    def find_tags(self):
+        """
+        Find information about the tags in the version control repository.
+
+        :returns: A generator of :py:class:`Revision` objects.
+        """
+        raise NotImplementedError()
 
     def __repr__(self):
         fields = []
@@ -353,9 +484,12 @@ class Revision(object):
 
     :ivar branch: The name of the branch in which the revision exists (a
           string). If not available this will be ``None``.
+
+    :ivar tag: The name of the tag associated to the revision (a string). If
+          not available this will be ``None``.
     """
 
-    def __init__(self, repository, revision_id, revision_number=None, branch=None):
+    def __init__(self, repository, revision_id, revision_number=None, branch=None, tag=None):
         """
         Create a :py:class:`Revision` object.
 
@@ -368,6 +502,7 @@ class Revision(object):
         self.revision_id = revision_id
         self._revision_number = revision_number
         self.branch = branch
+        self.tag = tag
 
     @property
     def revision_number(self):
@@ -376,12 +511,14 @@ class Revision(object):
         return self._revision_number
 
     def __repr__(self):
-        fields = ["repository=%r" % self.repository,
-                  "revision_id=%r" % self.revision_id]
+        fields = ["repository=%r" % self.repository]
         if self.branch:
             fields.append("branch=%r" % self.branch)
+        if self.tag:
+            fields.append("tag=%r" % self.tag)
         if self._revision_number is not None:
             fields.append("revision_number=%r" % self._revision_number)
+        fields.append("revision_id=%r" % self.revision_id)
         return "%s(%s)" % (self.__class__.__name__, ', '.join(fields))
 
 class HgRepo(Repository):
@@ -394,6 +531,7 @@ class HgRepo(Repository):
 
     friendly_name = 'Mercurial'
     default_revision = 'default'
+    control_field = 'Vcs-Hg'
     create_command = 'hg clone --noupdate {remote} {local}'
     update_command = 'hg pull --repository {local} {remote}'
     export_command = 'hg archive --repository {local} --rev {revision} {directory}'
@@ -424,12 +562,23 @@ class HgRepo(Repository):
         listing = execute('hg', '--repository', self.local, 'branches', capture=True)
         for line in listing.splitlines():
             tokens = line.split()
-            if len(tokens) >= 2:
+            if len(tokens) >= 2 and ':' in tokens[1]:
                 revision_number, revision_id = tokens[1].split(':')
                 yield Revision(repository=self,
                                revision_id=revision_id,
                                revision_number=int(revision_number),
                                branch=tokens[0])
+
+    def find_tags(self):
+        listing = execute('hg', '--repository', self.local, 'tags', capture=True)
+        for line in listing.splitlines():
+            tokens = line.split()
+            if len(tokens) >= 2 and ':' in tokens[1]:
+                revision_number, revision_id = tokens[1].split(':')
+                yield Revision(repository=self,
+                               revision_id=revision_id,
+                               revision_number=int(revision_number),
+                               tag=tokens[0])
 
 class GitRepo(Repository):
 
@@ -441,6 +590,7 @@ class GitRepo(Repository):
 
     friendly_name = 'Git'
     default_revision = 'master'
+    control_field = 'Vcs-Git'
     create_command = 'git clone --bare {remote} {local}'
     update_command = 'cd {local} && git fetch {remote}'
     export_command = 'cd {local} && git archive {revision} | tar --extract --directory={directory}'
@@ -478,5 +628,114 @@ class GitRepo(Repository):
                     yield Revision(repository=self,
                                    revision_id=tokens[1],
                                    branch=tokens[0])
+
+    def find_tags(self):
+        listing = execute('git', 'show-ref', '--tags', capture=True, directory=self.local)
+        for line in listing.splitlines():
+            tokens = line.split()
+            if len(tokens) >= 2 and tokens[1].startswith('refs/tags/'):
+                yield Revision(repository=self,
+                               revision_id=tokens[0],
+                               tag=tokens[1][len('refs/tags/'):])
+
+class BzrRepo(Repository):
+
+    """
+    Version control repository interface for Bazaar_ repositories.
+
+    .. _Bazaar: http://bazaar.canonical.com/en/
+    """
+
+    friendly_name = 'Bazaar'
+    default_revision = 'last:1'
+    control_field = 'Vcs-Bzr'
+    create_command = 'bzr branch --use-existing-dir {remote} {local}'
+    update_command = 'cd {local} && bzr pull {remote}'
+    export_command = 'cd {local} && bzr export --revision={revision} {directory}'
+
+    @property
+    def vcs_directory(self):
+        return os.path.join(self.local, '.bzr')
+
+    @property
+    def exists(self):
+        return os.path.isfile(os.path.join(self.vcs_directory, 'branch-format'))
+
+    def find_revision_number(self, revision=None):
+        # Bazaar has the concept of dotted revision numbers:
+        #
+        #   For revisions which have been merged into a branch, a dotted
+        #   notation is used (e.g., 3112.1.5). Dotted revision numbers have
+        #   three numbers. The first number indicates what mainline revision
+        #   change is derived from. The second number is the branch counter.
+        #   There can be many branches derived from the same revision, so they
+        #   all get a unique number. The third number is the number of
+        #   revisions since the branch started. For example, 3112.1.5 is the
+        #   first branch from revision 3112, the fifth revision on that
+        #   branch.
+        #
+        #   (From http://doc.bazaar.canonical.com/bzr.2.6/en/user-guide/zen.html#understanding-revision-numbers)
+        #
+        # However we really just want to give a bare integer to our callers. It
+        # doesn't have to be globally accurate, but it should increase as new
+        # commits are made. Below is the equivalent of the git implementation
+        # for Bazaar.
+        self.create()
+        revision = revision or self.default_revision
+        result = execute('bzr', 'log', '--revision=..%s' % revision, '--line', capture=True, directory=self.local)
+        revision_number = len([line for line in result.splitlines() if line and not line.isspace()])
+        assert revision_number > 0, "Failed to find local revision number! ('bzr log --line' gave unexpected output)"
+        return revision_number
+
+    def find_revision_id(self, revision=None):
+        self.create()
+        revision = revision or self.default_revision
+        result = execute('bzr', 'version-info', '--revision=%s' % revision, '--custom', '--template={revision_id}', capture=True, directory=self.local)
+        logger.debug("Output of 'bzr version-info' command: %s", result)
+        assert result, "Failed to find global revision id! ('bzr version-info' gave unexpected output)"
+        return result
+
+    def find_branches(self):
+        logger.warning("Bazaar repository support doesn't include branches (consider using tags instead).")
+        return []
+
+    def find_tags(self):
+        # The `bzr tags' command reports tags pointing to non-existing
+        # revisions as `?' but doesn't provide revision ids. We can get the
+        # revision ids using the `bzr tags --show-ids' command but this command
+        # doesn't mark tags pointing to non-existing revisions. We combine
+        # the output of both because we want all the information.
+        valid_tags = []
+        listing = execute('bzr', 'tags', capture=True, directory=self.local)
+        for line in listing.splitlines():
+            tokens = line.split()
+            if len(tokens) == 2 and tokens[1] != '?':
+                valid_tags.append(tokens[0])
+        listing = execute('bzr', 'tags', '--show-ids', capture=True, directory=self.local)
+        for line in listing.splitlines():
+            tokens = line.split()
+            if len(tokens) == 2 and tokens[0] in valid_tags:
+                tag, revision_id = tokens
+                yield Revision(repository=self,
+                               revision_id=tokens[1],
+                               tag=tokens[0])
+
+class NoSuchRepositoryError(Exception):
+    """
+    Exception raised by :py:func:`find_configured_repository()` when the given
+    repository name doesn't match any of the configured repositories.
+    """
+
+class AmbiguousRepositoryNameError(Exception):
+    """
+    Exception raised by :py:func:`find_configured_repository()` when the given
+    repository name is ambiguous (i.e. it matches multiple repository names).
+    """
+
+class UnknownRepositoryTypeError(Exception):
+    """
+    Exception raised by :py:func:`find_configured_repository()` when it
+    encounters a repository definition with an unknown type.
+    """
 
 # vim: ts=4 sw=4 et
