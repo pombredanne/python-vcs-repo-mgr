@@ -1,4 +1,6 @@
-coloredlogs >= 0.5
+coloredlogs >= 6.1
 executor >= 1.2
-humanfriendly >= 1.8.1
+humanfriendly >= 1.44.4
+naturalsort >= 1.3
+property-manager >= 1.3
 six >= 1.8.0

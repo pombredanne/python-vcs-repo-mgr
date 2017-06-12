@@ -3,62 +3,155 @@
 # Setup script for the `vcs-repo-mgr' package.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: September 14, 2014
+# Last Change: April 29, 2017
 # URL: https://github.com/xolox/python-vcs-repo-mgr
 
+"""
+Setup script for the `vcs-repo-mgr` package.
+
+**python setup.py install**
+  Install from the working directory into the current Python environment.
+
+**python setup.py sdist**
+  Build a source distribution archive.
+
+**python setup.py bdist_wheel**
+  Build a wheel distribution archive.
+"""
+
+# Standard library modules.
+import codecs
 import os
 import re
 import sys
-from os.path import abspath, dirname, join
-from setuptools import setup, find_packages
 
-# Find the directory where the source distribution was unpacked.
-source_directory = dirname(abspath(__file__))
+# De-facto standard solution for Python packaging.
+from setuptools import find_packages, setup
 
-# Find the current version.
-module = join(source_directory, 'vcs_repo_mgr', '__init__.py')
-for line in open(module, 'r'):
-    match = re.match(r'^__version__\s*=\s*["\']([^"\']+)["\']$', line)
-    if match:
-        version_string = match.group(1)
-        break
-else:
-    raise Exception("Failed to extract version from %s!" % module)
+PY2 = (sys.version_info[0] == 2)
+""":data:`True` on Python 2, :data:`False` otherwise."""
 
-# Fill in the long description (for the benefit of PyPI)
-# with the contents of README.rst (rendered by GitHub).
-readme_file = join(source_directory, 'README.rst')
-readme_text = open(readme_file, 'r').read()
+PYTHON_TWO_DEPS = ['bzr >= 2.6.0', 'mercurial >= 2.9']
+"""
+The `vcs-repo-mgr` package depends on Bazaar and Mercurial which don't support
+Python 3 (at the time of writing) while `vcs-repo-mgr` does support Python 3.
 
-# Fill in the "install_requires" field based on requirements.txt.
-requirements = [l.strip() for l in open(join(source_directory, 'requirements.txt'), 'r') if not l.startswith('#')]
+On the one hand it's nice to pull in recent versions of these dependencies as
+installation requirements when possible, it definitely shouldn't make it
+impossible to install `vcs-repo-mgr` under Python 3. Because of this the Bazaar
+and Mercurial dependencies are conditional; users that are running Python 3 are
+expected to install Bazaar and/or Mercurial via e.g. their system package
+manager.
+"""
 
-# The vcs-repo-mgr package depends on Mercurial however Mercurial doesn't
-# support Python 3.x while vcs-repo-mgr does support Python 3.x. Because most
-# users will be using Python 2.x in the foreseeable future I've decided to be
-# pragmatic about things and turn Mercurial into a conditional dependency.
-# See also: http://mercurial.selenic.com/wiki/SupportedPythonVersions
-if sys.version_info[0] == 2:
-    requirements.append('bzr >= 2.6.0')
-    requirements.append('mercurial >= 2.9')
-else:
-    # If Mercurial is not included in the Python requirements then it should at
-    # least be included in the Debian package dependencies.
-    with open(os.path.join(source_directory, 'stdeb.cfg'), 'w') as handle:
+
+def get_contents(*args):
+    """Get the contents of a file relative to the source distribution directory."""
+    with codecs.open(get_absolute_path(*args), 'r', 'UTF-8') as handle:
+        return handle.read()
+
+
+def get_version(*args):
+    """Extract the version number from a Python module."""
+    contents = get_contents(*args)
+    metadata = dict(re.findall('__([a-z]+)__ = [\'"]([^\'"]+)', contents))
+    return metadata['version']
+
+
+def get_install_requires():
+    """Add conditional dependencies for Python 2 (when creating source distributions)."""
+    install_requires = get_requirements('requirements.txt')
+    if PY2 and 'bdist_wheel' not in sys.argv:
+        install_requires.extend(PYTHON_TWO_DEPS)
+    return sorted(install_requires)
+
+
+def get_extras_require():
+    """Add conditional dependencies for Python 2 (when creating wheel distributions)."""
+    extras_require = {}
+    if have_environment_marker_support():
+        expression = ':python_version == "2.6" or python_version == "2.7"'
+        extras_require[expression] = list(PYTHON_TWO_DEPS)
+    return extras_require
+
+
+def get_requirements(*args):
+    """Get requirements from pip requirement files."""
+    requirements = set()
+    with open(get_absolute_path(*args)) as handle:
+        for line in handle:
+            # Strip comments.
+            line = re.sub(r'^#.*|\s#.*', '', line)
+            # Ignore empty lines
+            if line and not line.isspace():
+                requirements.add(re.sub(r'\s+', '', line))
+    return sorted(requirements)
+
+
+def get_absolute_path(*args):
+    """Transform relative pathnames into absolute pathnames."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), *args)
+
+
+def have_environment_marker_support():
+    """
+    Check whether setuptools has support for PEP-426 environment marker support.
+
+    Based on the ``setup.py`` script of the ``pytest`` package:
+    https://bitbucket.org/pytest-dev/pytest/src/default/setup.py
+    """
+    try:
+        from pkg_resources import parse_version
+        from setuptools import __version__
+        return parse_version(__version__) >= parse_version('0.7.2')
+    except Exception:
+        return False
+
+
+# When our installation requirements include Bazaar and Mercurial it is silly
+# to also require the Bazaar and Mercurial system packages through stdeb.cfg
+# so we overwrite the file to remove these dependencies.
+if PY2:
+    with open(get_absolute_path('stdeb.cfg'), 'w') as handle:
         handle.write('[vcs-repo-mgr]\n')
-        handle.write('Depends: bzr, git | git-core, mercurial\n')
-        handle.write('XS-Python-Version: >= 2.6\n')
+        handle.write('Depends: git | git-core\n')
+
 
 setup(name='vcs-repo-mgr',
-      version=version_string,
-      description='Version control repository manager',
-      long_description=readme_text,
+      version=get_version('vcs_repo_mgr', '__init__.py'),
+      description="Version control repository manager",
+      long_description=get_contents('README.rst'),
       url='https://github.com/xolox/python-vcs-repo-mgr',
-      author='Peter Odding',
+      author="Peter Odding",
       author_email='peter@peterodding.com',
       packages=find_packages(),
-      entry_points={'console_scripts': ['vcs-tool = vcs_repo_mgr.cli:main']},
-      install_requires=requirements,
-      test_suite='vcs_repo_mgr.tests')
-
-# vim: ts=4 sw=4
+      entry_points=dict(console_scripts=[
+          'vcs-tool = vcs_repo_mgr.cli:main',
+      ]),
+      install_requires=get_install_requires(),
+      extras_require=get_extras_require(),
+      test_suite='vcs_repo_mgr.tests',
+      classifiers=[
+          'Development Status :: 5 - Production/Stable',
+          'Environment :: Console',
+          'Intended Audience :: Developers',
+          'Intended Audience :: Information Technology',
+          'Intended Audience :: System Administrators',
+          'License :: OSI Approved :: MIT License',
+          'Operating System :: POSIX',
+          'Operating System :: Unix',
+          'Programming Language :: Python',
+          'Programming Language :: Python :: 2',
+          'Programming Language :: Python :: 2.6',
+          'Programming Language :: Python :: 2.7',
+          'Programming Language :: Python :: 3',
+          'Programming Language :: Python :: 3.4',
+          'Programming Language :: Python :: 3.5',
+          'Programming Language :: Python :: 3.6',
+          'Topic :: Software Development :: Libraries :: Python Modules',
+          'Topic :: Software Development :: Version Control',
+          'Topic :: System :: Archiving :: Packaging',
+          'Topic :: System :: Software Distribution',
+          'Topic :: System :: Systems Administration',
+          'Topic :: Utilities',
+      ])
